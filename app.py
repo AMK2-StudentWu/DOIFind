@@ -4,9 +4,10 @@ import html
 import requests
 import pandas as pd
 import streamlit as st
+import xml.etree.ElementTree as ET
 
 st.set_page_config(page_title="Title → DOI 批量查询", layout="wide")
-st.title("Title → DOI 批量查询（Crossref + DBLP，严格匹配）")
+st.title("Title → DOI 批量查询（Crossref + DBLP + arXiv，严格匹配）")
 
 # ========= Secrets / 配置 =========
 # 建议在 Streamlit Secrets 里配置：CROSSREF_MAILTO = "you@example.com"
@@ -19,7 +20,8 @@ with colA:
         "- 仅标题：Title\n"
         "- 标题 + 作者姓（推荐）：Title<TAB>Salehi\n"
         "分隔符支持：Tab / || / | / ;\n\n"
-        "匹配规则：标题规范化后**完全一致**才算命中；命中失败则显示候选 Top-3（不自动选）。"
+        "匹配规则：标题规范化后**完全一致**才算命中；命中失败可显示候选 Top-3（不自动选）。\n"
+        "优先级：Crossref → DBLP → arXiv（最后兜底，可能返回 arXiv ID / DOI）。"
     )
 with colB:
     if not mailto:
@@ -27,12 +29,16 @@ with colB:
 
 text = st.text_area("每行一条标题（建议英文原题）", height=220, placeholder="A unified survey on ...\tSalehi")
 
-c1, c2, c3 = st.columns([1, 1, 2])
+c1, c2, c3, c4, c5 = st.columns([1, 1, 1, 1, 2])
 with c1:
     delay = st.slider("每次请求间隔（秒）", 0.0, 1.0, 0.25, 0.05)
 with c2:
     show_candidates = st.checkbox("显示候选 Top-3（仅在搜索不到时）", value=True)
 with c3:
+    use_dblp = st.checkbox("启用 DBLP 备选搜索", value=True)
+with c4:
+    use_arxiv = st.checkbox("启用 arXiv 备选搜索（最后）", value=True)
+with c5:
     st.write("")
 
 use_author_check = st.checkbox("启用作者校验（更严格，误匹配更低）", value=True)
@@ -104,27 +110,25 @@ def format_candidates(cands: list[str], k=3) -> str:
         return ""
     return "\n".join([f"- {c}" for c in cands])
 
+def _ua():
+    # 给所有请求加 UA，减少被当成匿名爬虫的概率
+    if mailto:
+        return f"streamlit-doi-lookup/1.4 (mailto:{mailto})"
+    return "streamlit-doi-lookup/1.4"
+
 # ========= Crossref（严格） =========
 @st.cache_data(show_spinner=False)
 def crossref_strict(title: str, author_hint: str, mailto: str, use_auth: bool, auth_mode: str):
-    params = {
-        "query.title": title,
-        "rows": 20,
-        "select": "DOI,title,author"
-    }
+    params = {"query.title": title, "rows": 20, "select": "DOI,title,author"}
     if mailto:
         params["mailto"] = mailto
-
-    headers = {
-        "User-Agent": f"streamlit-doi-lookup/1.2 (mailto:{mailto})" if mailto else "streamlit-doi-lookup/1.2"
-    }
+    headers = {"User-Agent": _ua()}
 
     r = requests.get("https://api.crossref.org/works", params=params, headers=headers, timeout=20)
     r.raise_for_status()
     items = r.json().get("message", {}).get("items", [])
 
     target = norm_title(title)
-
     for it in items:
         got_title = (it.get("title") or [""])[0]
         if norm_title(got_title) != target:
@@ -143,10 +147,9 @@ def crossref_strict(title: str, author_hint: str, mailto: str, use_auth: bool, a
 
         doi = it.get("DOI", "") or ""
         if doi:
-            return {"status": "FOUND", "source": "Crossref", "doi": doi, "matched_title": got_title, "candidates": []}
-        return {"status": "MATCHED_BUT_NO_DOI", "source": "Crossref", "doi": "", "matched_title": got_title, "candidates": []}
+            return {"status": "FOUND", "source": "Crossref", "doi": doi, "arxiv_id": "", "matched_title": got_title, "candidates": []}
+        return {"status": "MATCHED_BUT_NO_DOI", "source": "Crossref", "doi": "", "arxiv_id": "", "matched_title": got_title, "candidates": []}
 
-    # 严格没命中：返回候选（不自动选）
     candidates = []
     for it in items:
         t = (it.get("title") or [""])[0]
@@ -154,29 +157,48 @@ def crossref_strict(title: str, author_hint: str, mailto: str, use_auth: bool, a
         if t:
             candidates.append(f"{t}" + (f" (doi: {d})" if d else ""))
 
-    return {"status": "NOT_FOUND", "source": "Crossref", "doi": "", "matched_title": "", "candidates": candidates}
+    return {"status": "NOT_FOUND", "source": "Crossref", "doi": "", "arxiv_id": "", "matched_title": "", "candidates": candidates}
 
-# ========= DBLP（严格） =========
+# ========= DBLP（严格，带重试与降级） =========
 @st.cache_data(show_spinner=False)
 def dblp_strict(title: str, author_hint: str, use_auth: bool, auth_mode: str):
     params = {"q": title, "format": "json", "h": 25}
-    r = requests.get("https://dblp.org/search/publ/api", params=params, timeout=20)
-    r.raise_for_status()
-    data = r.json()
+    headers = {"User-Agent": _ua()}
+
+    backoffs = [0.0, 0.6, 1.2]
+    last_err = None
+    data = None
+
+    for b in backoffs:
+        if b > 0:
+            time.sleep(b)
+        try:
+            r = requests.get("https://dblp.org/search/publ/api", params=params, headers=headers, timeout=20)
+            if r.status_code in (429, 500, 502, 503, 504):
+                last_err = f"DBLP {r.status_code}"
+                continue
+            r.raise_for_status()
+            data = r.json()
+            break
+        except Exception as e:
+            last_err = str(e)
+            continue
+
+    if not data:
+        return {"status": "NOT_FOUND", "source": "DBLP", "doi": "", "arxiv_id": "", "matched_title": "",
+                "candidates": [f"[DBLP] 请求失败或暂时不可用：{last_err or 'unknown'}"]}
 
     hits = (((data.get("result") or {}).get("hits") or {}).get("hit")) or []
     if isinstance(hits, dict):
         hits = [hits]
 
     target = norm_title(title)
-
     for h in hits:
         info = h.get("info", {}) or {}
         got_title = info.get("title", "") or ""
         if norm_title(got_title) != target:
             continue
 
-        # authors
         cand_authors = []
         authors_obj = (info.get("authors") or {}).get("author")
         if isinstance(authors_obj, list):
@@ -199,8 +221,8 @@ def dblp_strict(title: str, author_hint: str, use_auth: bool, auth_mode: str):
                     break
 
         if doi:
-            return {"status": "FOUND", "source": "DBLP", "doi": doi, "matched_title": got_title, "candidates": []}
-        return {"status": "MATCHED_BUT_NO_DOI", "source": "DBLP", "doi": "", "matched_title": got_title, "candidates": []}
+            return {"status": "FOUND", "source": "DBLP", "doi": doi, "arxiv_id": "", "matched_title": got_title, "candidates": []}
+        return {"status": "MATCHED_BUT_NO_DOI", "source": "DBLP", "doi": "", "arxiv_id": "", "matched_title": got_title, "candidates": []}
 
     candidates = []
     for h in hits:
@@ -217,25 +239,78 @@ def dblp_strict(title: str, author_hint: str, use_auth: bool, auth_mode: str):
         if t:
             candidates.append(f"{t}" + (f" (doi: {d})" if d else ""))
 
-    return {"status": "NOT_FOUND", "source": "DBLP", "doi": "", "matched_title": "", "candidates": candidates}
+    return {"status": "NOT_FOUND", "source": "DBLP", "doi": "", "arxiv_id": "", "matched_title": "", "candidates": candidates}
+
+# ========= arXiv（严格，最后兜底） =========
+@st.cache_data(show_spinner=False)
+def arxiv_strict(title: str, author_hint: str, use_auth: bool, auth_mode: str):
+    headers = {"User-Agent": _ua()}
+    params = {"search_query": f'ti:"{title}"', "start": 0, "max_results": 10}
+    r = requests.get("http://export.arxiv.org/api/query", params=params, headers=headers, timeout=20)
+    r.raise_for_status()
+
+    root = ET.fromstring(r.text)
+    ns = {"atom": "http://www.w3.org/2005/Atom", "arxiv": "http://arxiv.org/schemas/atom"}
+
+    target = norm_title(title)
+    candidates = []
+
+    for entry in root.findall("atom:entry", ns):
+        raw_title = (entry.findtext("atom:title", default="", namespaces=ns) or "").strip()
+        got_title = re.sub(r"\s+", " ", raw_title).strip()
+
+        auths = []
+        for a in entry.findall("atom:author", ns):
+            name = (a.findtext("atom:name", default="", namespaces=ns) or "").strip()
+            if name:
+                auths.append(name)
+
+        doi = (entry.findtext("arxiv:doi", default="", namespaces=ns) or "").strip()
+
+        full_id = (entry.findtext("atom:id", default="", namespaces=ns) or "").strip()
+        arxiv_id = ""
+        if "/abs/" in full_id:
+            arxiv_id = full_id.split("/abs/")[-1].strip()
+
+        if got_title:
+            candidates.append(f"{got_title}" + (f" (arXiv: {arxiv_id})" if arxiv_id else "") + (f" (doi: {doi})" if doi else ""))
+
+        if norm_title(got_title) != target:
+            continue
+        if use_auth and not author_matches(author_hint, auths, auth_mode):
+            continue
+
+        if arxiv_id:
+            return {"status": "FOUND_ARXIV", "source": "arXiv", "doi": doi or "", "arxiv_id": arxiv_id, "matched_title": got_title, "candidates": []}
+        return {"status": "MATCHED_BUT_NO_ID", "source": "arXiv", "doi": doi or "", "arxiv_id": "", "matched_title": got_title, "candidates": []}
+
+    return {"status": "NOT_FOUND", "source": "arXiv", "doi": "", "arxiv_id": "", "matched_title": "", "candidates": candidates}
 
 def lookup(title: str, author_hint: str):
     cr = crossref_strict(title, author_hint, mailto, use_author_check, author_mode)
     if cr["status"] != "NOT_FOUND":
         return cr
 
-    db = dblp_strict(title, author_hint, use_author_check, author_mode)
-    if db["status"] != "NOT_FOUND":
-        return db
+    db = {"candidates": []}
+    if use_dblp:
+        db = dblp_strict(title, author_hint, use_author_check, author_mode)
+        if db["status"] != "NOT_FOUND":
+            return db
+
+    ax = {"candidates": []}
+    if use_arxiv:
+        ax = arxiv_strict(title, author_hint, use_author_check, author_mode)
+        if ax["status"] != "NOT_FOUND":
+            return ax
 
     merged = []
     if show_candidates:
         merged += [f"[Crossref] {c}" for c in (cr.get("candidates") or [])]
         merged += [f"[DBLP] {c}" for c in (db.get("candidates") or [])]
+        merged += [f"[arXiv] {c}" for c in (ax.get("candidates") or [])]
 
-    return {"status": "NOT_FOUND", "source": "-", "doi": "", "matched_title": "", "candidates": merged}
+    return {"status": "NOT_FOUND", "source": "-", "doi": "", "arxiv_id": "", "matched_title": "", "candidates": merged}
 
-# ========= 执行 =========
 if st.button("开始查询"):
     lines = [ln for ln in text.splitlines() if ln.strip()]
     tasks = [parse_line(ln) for ln in lines]
@@ -247,10 +322,11 @@ if st.button("开始查询"):
     for i, (title, author_hint) in enumerate(tasks, 1):
         try:
             res = lookup(title, author_hint)
-
             status_cn = {
                 "FOUND": "命中",
                 "MATCHED_BUT_NO_DOI": "命中但无DOI",
+                "FOUND_ARXIV": "命中(arXiv)",
+                "MATCHED_BUT_NO_ID": "命中(arXiv但无ID)",
                 "NOT_FOUND": "搜索不到",
             }.get(res["status"], res["status"])
 
@@ -264,6 +340,7 @@ if st.button("开始查询"):
                 "status": status_cn,
                 "source": res["source"],
                 "doi": res["doi"],
+                "arxiv_id": res.get("arxiv_id", ""),
                 "matched_title": res["matched_title"],
                 "candidates_top3": cand_text,
             })
@@ -274,6 +351,7 @@ if st.button("开始查询"):
                 "status": "ERROR",
                 "source": "-",
                 "doi": "",
+                "arxiv_id": "",
                 "matched_title": "",
                 "candidates_top3": str(e),
             })
@@ -283,7 +361,6 @@ if st.button("开始查询"):
 
     df = pd.DataFrame(rows)
 
-    # 表格字体调大
     styler = (
         df.style
         .set_properties(**{"font-size": "16px", "white-space": "pre-wrap"})
